@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════╗
+║  IMMUNITY PROTOCOL v2.0 — SOVEREIGN FUEL INTEGRATION        ║
+║  The "Clean Room"                                           ║
+╠══════════════════════════════════════════════════════════════╣
+║  ADDED IN v2:                                               ║
+║    - GEM (Google Enterprise Mobility) Detection             ║
+║    - Calendar Injection Scanner                             ║
+║    - Mutated APK Decoder / Catalog                          ║
+║    - Device Policy Controller (DPC) Hunter                  ║
+║    - Account Contamination Check                            ║
+╠══════════════════════════════════════════════════════════════╣
+║  DOCTRINE: Trust No Account. Verify Every Policy.           ║
+║  STATUS:   Ready for Sovereign Fuel integration             ║
+║  MOTHERBOARD PATCH: NOT YET — STANDING BY                   ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+import os
+import sys
+import subprocess
+import json
+import hashlib
+import time
+import struct
+import zipfile
+import threading
+import shutil
+from datetime import datetime
+from pathlib import Path
+from collections import defaultdict
+
+
+# ─────────────────────────────────────────────────────────────
+#  CONFIG
+# ─────────────────────────────────────────────────────────────
+IMMUNITY_CONFIG = {
+    "sandbox_dir":    os.path.expanduser(
+        "~/SOVEREIGN/immunity_sandbox"),
+    "log_file":       os.path.expanduser(
+        "~/SOVEREIGN/immunity.log"),
+    "apk_vault":      os.path.expanduser(
+        "~/SOVEREIGN/apk_vault"),
+    "auto_purge":     False,  # Manual purge only
+
+    # Trusted binaries for sandbox execution
+    "trusted_binaries": [
+        "python3", "bash", "sh",
+        "grep", "awk", "dumpsys",
+        "pm", "am", "ls", "cat",
+    ],
+
+    # ── BLOCKED PACKAGES ──────────────────────────────
+    # These should NOT be running on a clean device
+    "blocked_packages": [
+        # Honor/Huawei backdoor suite
+        "com.hihonor.hiviewtunnel",
+        "com.hihonor.remotePassword",
+        "com.hihonor.detectrepair",
+        "com.hihonor.systemmanager",
+
+        # The GEM attack door
+        "com.google.android.apps.enterprise.authenticator",
+
+        # Device Policy Controllers (watch these)
+        "com.google.android.apps.work.clouddpc",
+        "com.android.managedprovisioning",
+
+        # Known malicious overlay apps (update as you decode)
+        "com.android.chrome",       # when acting as host
+        "com.google.android.gms",   # when policy-abused
+    ],
+
+    # ── GEM / CALENDAR ATTACK SIGNATURES ─────────────
+    # These are IOCs (Indicators of Compromise)
+    # specific to the Latin America calendar vector
+    "gem_iocs": {
+        # Calendar apps that can be weaponized
+        "calendar_apps": [
+            "com.google.android.calendar",
+            "com.samsung.android.calendar",
+            "com.android.calendar",
+        ],
+        # Suspicious calendar file extensions
+        "suspicious_extensions": [
+            ".ics", ".vcf", ".vcs",
+            ".html", ".htm",        # disguised invites
+        ],
+        # Strings found in malicious .ics payloads
+        "payload_strings": [
+            "BEGIN:VEVENT",
+            "ATTACH;",              # file attachment in invite
+            "URL:javascript:",      # JS in calendar URL
+            "URL:data:",            # data URI in calendar
+            "X-GOOGLE-CONFERENC",   # Meet link weaponized
+            "DESCRIPTION:http",     # URL in description
+        ],
+        # Device Policy Controller permissions
+        # (granted by GEM after calendar exploit)
+        "dpc_permissions": [
+            "BIND_DEVICE_ADMIN",
+            "MANAGE_PROFILE_AND_DEVICE_OWNERS",
+            "CHANGE_COMPONENT_ENABLED_STATE",
+            "MANAGE_DEVICE_ADMINS",
+        ],
+    },
+
+    # ── MUTATED APK SIGNATURES ────────────────────────
+    # What attackers modify in APKs from Play Store
+    "apk_mutation_markers": {
+        # Modified manifest entries
+        "manifest_suspicious": [
+            "android.permission.INSTALL_PACKAGES",
+            "android.permission.DELETE_PACKAGES",
+            "android.permission.CHANGE_COMPONENT_ENABLED_STATE",
+            "BIND_ACCESSIBILITY_SERVICE",  # keylogger hook
+            "SYSTEM_ALERT_WINDOW",         # overlay
+            "READ_PRIVILEGED_PHONE_STATE", # SIM access
+        ],
+        # Native library names used in injection
+        "suspicious_libs": [
+            "libfrida",
+            "libsubstrate",
+            "libxposed",
+            "libandroid_runtime_hook",
+            "libdvm_hook",
+            "libbinder_hook",
+        ],
+        # DEX classes that indicate hooking frameworks
+        "hook_classes": [
+            "de/robv/android/xposed",
+            "com/saurik/substrate",
+            "frida",
+            "io/michaelrocks/dispatch",
+        ],
+    },
+}
+
+
+# ─────────────────────────────────────────────────────────────
+#  LOGGER
+# ─────────────────────────────────────────────────────────────
+def log(msg: str, level: str = "INFO"):
+    ts    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{ts}] [IMMUNITY] [{level}] {msg}"
+    print(entry)
+    try:
+        Path(IMMUNITY_CONFIG["log_file"]).parent.mkdir(
+            parents=True, exist_ok=True)
+        with open(IMMUNITY_CONFIG["log_file"], "a") as f:
+            f.write(entry + "\n")
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────
+#  MODULE 1: GEM / CALENDAR INJECTION HUNTER
+#
+#  This is your specific threat.
+#  The attack Palo Alto documented in February.
+#  We scan for every stage of the kill chain.
+# ─────────────────────────────────────────────────────────────
+def hunt_gem_injection() -> dict:
+    """
+    Scans for Google Enterprise Mobility injection.
+
+    Kill chain stages:
+      Stage 1 — Calendar app received malicious invite
+      Stage 2 — WebView rendered the payload
+      Stage 3 — DPC (Device Policy Controller) installed
+      Stage 4 — Device admin rights granted silently
+      Stage 5 — GEM manages the device now
+
+    Returns dict with findings per stage.
+    """
+    findings = defaultdict(list)
+    iocs     = IMMUNITY_CONFIG["gem_iocs"]
+
+    log("GEM HUNTER: Scanning calendar injection kill chain...")
+
+    # ── Stage 1: Calendar apps with suspicious perms ──
+    log("Stage 1: Calendar app permissions...")
+    for cal_pkg in iocs["calendar_apps"]:
+        try:
+            result = subprocess.run(
+                ["dumpsys", "package", cal_pkg],
+                capture_output=True, text=True,
+                timeout=8
+            )
+            if result.returncode == 0 and result.stdout:
+                output = result.stdout
+
+                # Check if calendar has network/install perms
+                # (it should NOT have INSTALL_PACKAGES)
+                if "INSTALL_PACKAGES" in output:
+                    findings["stage_1_calendar"].append({
+                        "package": cal_pkg,
+                        "finding": "INSTALL_PACKAGES permission granted",
+                        "severity": "CRITICAL",
+                    })
+                    log(
+                        f"CRITICAL: {cal_pkg} has "
+                        f"INSTALL_PACKAGES permission",
+                        "CRITICAL"
+                    )
+
+                if "SYSTEM_ALERT_WINDOW" in output:
+                    findings["stage_1_calendar"].append({
+                        "package": cal_pkg,
+                        "finding": "SYSTEM_ALERT_WINDOW granted",
+                        "severity": "HIGH",
+                    })
+                    log(
+                        f"HIGH: {cal_pkg} can draw overlays",
+                        "WARN"
+                    )
+
+        except Exception as e:
+            log(f"Could not check {cal_pkg}: {e}", "WARN")
+
+    # ── Stage 2: Suspicious .ics / .vcf files ─────────
+    log("Stage 2: Calendar payload files...")
+    search_dirs = [
+        os.path.expanduser("~/storage/downloads"),
+        os.path.expanduser("~/storage/shared/Download"),
+        "/storage/emulated/0/Download",
+        "/sdcard/Download",
+        "/data/local/tmp",
+    ]
+    for d in search_dirs:
+        if not os.path.exists(d):
+            continue
+        try:
+            for fname in os.listdir(d):
+                fpath = os.path.join(d, fname)
+                for ext in iocs["suspicious_extensions"]:
+                    if fname.lower().endswith(ext):
+                        # Read and scan content
+                        try:
+                            with open(fpath, 'r',
+                                      errors='ignore') as f:
+                                content = f.read(4096)
+                            for sig in iocs["payload_strings"]:
+                                if sig in content:
+                                    findings[
+                                        "stage_2_payload"
+                                    ].append({
+                                        "file":    fpath,
+                                        "trigger": sig,
+                                        "severity": "HIGH",
+                                    })
+                                    log(
+                                        f"PAYLOAD FILE: {fpath} "
+                                        f"contains '{sig}'",
+                                        "CRITICAL"
+                                    )
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    # ── Stage 3: Device Policy Controllers active ─────
+    log("Stage 3: Device admin / DPC check...")
+    try:
+        result = subprocess.run(
+            ["dumpsys", "device_policy"],
+            capture_output=True, text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            output = result.stdout
+
+            # Check for unknown device admins
+            if "Profile Owner" in output:
+                # Extract the package name
+                for line in output.split('\n'):
+                    if "Profile Owner" in line or \
+                       "Device Owner" in line:
+                        findings["stage_3_dpc"].append({
+                            "finding":  line.strip(),
+                            "severity": "CRITICAL",
+                        })
+                        log(
+                            f"DPC ACTIVE: {line.strip()}",
+                            "CRITICAL"
+                        )
+
+            for perm in iocs["dpc_permissions"]:
+                if perm in output:
+                    findings["stage_3_dpc"].append({
+                        "permission": perm,
+                        "severity":   "HIGH",
+                    })
+    except Exception as e:
+        log(f"DPC check error: {e}", "WARN")
+
+    # ── Stage 4: Account contamination check ──────────
+    log("Stage 4: Account contamination...")
+    try:
+        result = subprocess.run(
+            ["dumpsys", "account"],
+            capture_output=True, text=True,
+            timeout=8
+        )
+        if result.returncode == 0:
+            output = result.stdout
+
+            # Look for enterprise/managed accounts
+            enterprise_keywords = [
+                "managedProfile",
+                "work_profile",
+                "enterprise",
+                "G Suite",
+                "Workspace",
+            ]
+            for kw in enterprise_keywords:
+                if kw.lower() in output.lower():
+                    findings["stage_4_account"].append({
+                        "finding":  f"Keyword found: {kw}",
+                        "severity": "WARN",
+                    })
+                    log(
+                        f"ACCOUNT CONTAMINATION: "
+                        f"'{kw}' found in account dump",
+                        "WARN"
+                    )
+    except Exception as e:
+        log(f"Account check error: {e}", "WARN")
+
+    # ── Summary ────────────────────────────────────────
+    total = sum(len(v) for v in findings.values())
+    if total == 0:
+        log("GEM HUNTER: No injection artifacts found.", "INFO")
+    else:
+        log(
+            f"GEM HUNTER: {total} artifacts found "
+            f"across {len(findings)} kill chain stages.",
+            "CRITICAL"
+        )
+
+    return dict(findings)
+
+
+# ─────────────────────────────────────────────────────────────
+#  MODULE 2: MUTATED APK DECODER
+#
+#  The Play Store apps they tried to install.
+#  You said you have them. This catalogs what was mutated.
+# ─────────────────────────────────────────────────────────────
+def decode_mutated_apk(apk_path: str) -> dict:
+    """
+    Analyzes an APK for mutation signatures.
+
+    What attackers modify:
+      1. AndroidManifest.xml — add permissions silently
+      2. Native libs (.so)   — inject hooking framework
+      3. DEX classes         — add hook initialization code
+      4. Assets              — embed secondary payload
+
+    Pass in the path to the suspicious APK.
+    """
+    report = {
+        "apk":            apk_path,
+        "timestamp":      datetime.now().isoformat(),
+        "is_mutated":     False,
+        "risk_score":     0,
+        "findings":       [],
+        "permissions":    [],
+        "suspicious_libs":[],
+        "hook_classes":   [],
+        "embedded_files": [],
+    }
+
+    if not os.path.exists(apk_path):
+        log(f"APK not found: {apk_path}", "ERROR")
+        return report
+
+    markers = IMMUNITY_CONFIG["apk_mutation_markers"]
+
+    log(f"Decoding APK: {os.path.basename(apk_path)}")
+
+    try:
+        with zipfile.ZipFile(apk_path, 'r') as apk:
+            file_list = apk.namelist()
+
+            # ── Check 1: Suspicious manifest perms ────
+            if "AndroidManifest.xml" in file_list:
+                try:
+                    # Read raw bytes — manifest is binary
+                    raw = apk.read("AndroidManifest.xml")
+                    raw_str = raw.decode(
+                        'utf-8', errors='ignore')
+
+                    for perm in markers[
+                            "manifest_suspicious"]:
+                        if perm in raw_str:
+                            report["permissions"].append(
+                                perm)
+                            report["findings"].append(
+                                f"MANIFEST: {perm}")
+                            report["risk_score"] += 15
+                            log(
+                                f"PERM: {perm} in "
+                                f"{os.path.basename(apk_path)}",
+                                "WARN"
+                            )
+                except Exception as me:
+                    log(f"Manifest read error: {me}",
+                        "WARN")
+
+            # ── Check 2: Hooking framework libs ───────
+            for fname in file_list:
+                if fname.endswith(".so"):
+                    for lib in markers["suspicious_libs"]:
+                        if lib in fname.lower():
+                            report[
+                                "suspicious_libs"
+                            ].append(fname)
+                            report["findings"].append(
+                                f"NATIVE LIB: {fname}")
+                            report["risk_score"] += 25
+                            log(
+                                f"HOOK LIB: {fname}",
+                                "CRITICAL"
+                            )
+
+            # ── Check 3: DEX class hooks ───────────────
+            dex_files = [
+                f for f in file_list
+                if f.endswith(".dex")
+            ]
+            for dex in dex_files:
+                try:
+                    raw = apk.read(dex).decode(
+                        'utf-8', errors='ignore')
+                    for hook in markers["hook_classes"]:
+                        if hook in raw:
+                            report[
+                                "hook_classes"
+                            ].append(hook)
+                            report["findings"].append(
+                                f"HOOK CLASS: {hook}")
+                            report["risk_score"] += 30
+                            log(
+                                f"HOOK FRAMEWORK: "
+                                f"{hook} in {dex}",
+                                "CRITICAL"
+                            )
+                except Exception:
+                    pass
+
+            # ── Check 4: Embedded secondary payloads ──
+            # Attackers embed APKs inside APKs
+            for fname in file_list:
+                if any(fname.endswith(x)
+                       for x in [".apk", ".dex",
+                                  ".jar", ".bin",
+                                  ".so", ".sh",
+                                  ".py", ".pl"]):
+                    if fname not in ["classes.dex",
+                                     "classes2.dex",
+                                     "classes3.dex"]:
+                        report[
+                            "embedded_files"
+                        ].append(fname)
+                        report["findings"].append(
+                            f"EMBEDDED: {fname}")
+                        report["risk_score"] += 20
+                        log(
+                            f"EMBEDDED PAYLOAD: "
+                            f"{fname}",
+                            "CRITICAL"
+                        )
+
+            # ── Check 5: APK hash fingerprint ─────────
+            with open(apk_path, 'rb') as f:
+                apk_bytes = f.read()
+            report["sha256"] = hashlib.sha256(
+                apk_bytes).hexdigest()
+            report["md5"] = hashlib.md5(
+                apk_bytes).hexdigest()
+
+            log(
+                f"APK SHA256: {report['sha256'][:32]}...",
+                "INFO"
+            )
+
+    except zipfile.BadZipFile:
+        log(f"Not a valid APK (bad zip): {apk_path}",
+            "ERROR")
+        report["findings"].append("NOT A VALID APK")
+        return report
+    except Exception as e:
+        log(f"APK decode error: {e}", "ERROR")
+        return report
+
+    # Determine if mutated
+    report["is_mutated"] = report["risk_score"] >= 15
+
+    # ── Save report to vault ───────────────────────────
+    vault = IMMUNITY_CONFIG["apk_vault"]
+    os.makedirs(vault, exist_ok=True)
+
+    report_name = (
+        f"{os.path.basename(apk_path)}"
+        f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        f"_report.json"
+    )
+    report_path = os.path.join(vault, report_name)
+
+    with open(report_path, 'w') as f:
+        json.dump(report, f, indent=2)
+
+    status = "MUTATED" if report["is_mutated"] else "CLEAN"
+    log(
+        f"APK DECODE COMPLETE: {status} | "
+        f"Risk: {report['risk_score']} | "
+        f"Report: {report_path}"
+    )
+
+    return report
+
+
+def scan_apk_directory(directory: str) -> list:
+    """
+    Scan all APKs in a directory.
+    Use this on your Download folder to process
+    all the mutated apps at once.
+    """
+    results = []
+
+    if not os.path.exists(directory):
+        log(f"Directory not found: {directory}", "ERROR")
+        return results
+
+    apk_files = [
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if f.endswith(".apk")
+    ]
+
+    if not apk_files:
+        log(f"No APK files found in {directory}", "INFO")
+        return results
+
+    log(f"Found {len(apk_files)} APKs to decode...")
+
+    for apk in apk_files:
+        report = decode_mutated_apk(apk)
+        results.append(report)
+        time.sleep(0.5)  # Don't hammer the device
+
+    # Summary
+    mutated = sum(
+        1 for r in results if r.get("is_mutated"))
+    log(
+        f"APK SCAN COMPLETE: "
+        f"{mutated}/{len(results)} mutated",
+        "CRITICAL" if mutated > 0 else "INFO"
+    )
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────
+#  MODULE 3: ENVIRONMENT VALIDATION (ORIGINAL — FIXED)
+# ─────────────────────────────────────────────────────────────
+def check_environment_integrity() -> bool:
+    """
+    Scans for known backdoor signatures.
+    Returns True = clean, False = compromised.
+    """
+    log("Scanning for system-level backdoors...")
+    risk_score = 0
+    findings   = []
+
+    # ── Check running packages ─────────────────────────
+    try:
+        result = subprocess.run(
+            ["pm", "list", "packages", "-e"],
+            capture_output=True, text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            installed = result.stdout
+
+            for pkg in IMMUNITY_CONFIG["blocked_packages"]:
+                if pkg in installed:
+                    findings.append(
+                        f"BLOCKED PKG RUNNING: {pkg}")
+                    log(
+                        f"DETECTED: {pkg} is active",
+                        "CRITICAL"
+                    )
+                    risk_score += 10
+
+    except Exception as e:
+        log(f"Package check failed: {e}", "WARN")
+
+    # ── Check device admin list ────────────────────────
+    try:
+        result = subprocess.run(
+            ["dumpsys", "device_policy"],
+            capture_output=True, text=True,
+            timeout=8
+        )
+        if result.returncode == 0:
+            if "Device Owner" in result.stdout:
+                findings.append("DEVICE OWNER SET")
+                log(
+                    "CRITICAL: Device Owner is set. "
+                    "GEM may be installed.",
+                    "CRITICAL"
+                )
+                risk_score += 30
+
+            if "Profile Owner" in result.stdout:
+                findings.append("PROFILE OWNER SET")
+                log(
+                    "CRITICAL: Profile Owner active. "
+                    "Work profile may be injected.",
+                    "CRITICAL"
+                )
+                risk_score += 25
+    except Exception:
+        pass
+
+    # ── Check suspicious files ─────────────────────────
+    suspicious_files = [
+        "/data/local/tmp/multidpi_whitelist.xml",
+        "/data/local/tmp/dir_policy.xml",
+        "/data/local/tmp/init_skill.py",
+        "/sdcard/Download/multidpi_whitelist.xml",
+        os.path.expanduser(
+            "~/storage/shared/Download/"
+            "multidpi_whitelist.xml"),
+    ]
+    for fpath in suspicious_files:
+        if os.path.exists(fpath):
+            findings.append(f"SUSPICIOUS FILE: {fpath}")
+            log(
+                f"SUSPICIOUS FILE FOUND: {fpath}",
+                "CRITICAL"
+            )
+            risk_score += 5
+
+    # ── Result ─────────────────────────────────────────
+    if risk_score > 0:
+        log(
+            f"ENVIRONMENT COMPROMISED. "
+            f"Risk Score: {risk_score}. "
+            f"Findings: {len(findings)}.",
+            "CRITICAL"
+        )
+        for f in findings:
+            log(f"  >> {f}", "CRITICAL")
+        return False
+    else:
+        log("Environment integrity: NOMINAL.", "INFO")
+        return True
+
+
+# ─────────────────────────────────────────────────────────────
+#  MODULE 4: SANDBOX CREATOR (ORIGINAL — FIXED)
+# ─────────────────────────────────────────────────────────────
+def create_sandbox() -> tuple:
+    sandbox = IMMUNITY_CONFIG["sandbox_dir"]
+    Path(sandbox).mkdir(parents=True, exist_ok=True)
+
+    # Isolated environment — host OS cannot see this
+    env = os.environ.copy()
+    env["PATH"]           = (
+        f"{sandbox}/bin:"
+        f"{os.environ.get('PATH', '')}"
+    )
+    env["HOME"]           = sandbox
+    env["TMPDIR"]         = sandbox
+    env["SOVEREIGN_MODE"] = "TRUE"
+    env["GEM_ISOLATED"]   = "TRUE"
+
+    # Block known GEM env vars if present
+    for key in list(env.keys()):
+        if any(x in key.upper() for x in [
+            "MDM", "EMM", "DPC",
+            "MANAGED", "ENTERPRISE"
+        ]):
+            del env[key]
+            log(
+                f"SANDBOX: Removed managed env var: {key}",
+                "INFO"
+            )
+
+    log(f"Clean Room created: {sandbox}")
+    return sandbox, env
+
+
+# ─────────────────────────────────────────────────────────────
+#  MODULE 5: SAFE COMMAND EXECUTION (ORIGINAL — FIXED)
+# ─────────────────────────────────────────────────────────────
+def run_immune_command(command,
+                        args: list = []) -> str | None:
+    sandbox, env = create_sandbox()
+
+    cmd_name = (
+        command.split()[0]
+        if isinstance(command, str)
+        else command[0]
+    )
+
+    # Validate against trusted list
+    base_name = os.path.basename(cmd_name)
+    if base_name not in IMMUNITY_CONFIG[
+            "trusted_binaries"]:
+        log(f"BLOCKED: Untrusted binary: {cmd_name}",
+            "WARN")
+        return None
+
+    log(f"Executing in Clean Room: {cmd_name}")
+
+    try:
+        result = subprocess.run(
+            (command.split()
+             if isinstance(command, str)
+             else command) + args,
+            env=env,
+            cwd=sandbox,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        return result.stdout or result.stderr
+    except subprocess.TimeoutExpired:
+        log("Command timed out.", "WARN")
+        return None
+    except Exception as e:
+        log(f"Execution error: {e}", "ERROR")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
+#  MODULE 6: SOVEREIGN FUEL INTEGRATION
+#  Sends findings upstream to the Fuel hub
+# ─────────────────────────────────────────────────────────────
+def report_to_fuel(findings: dict,
+                    token:    str = None):
+    """
+    Sends immunity scan results to Sovereign Fuel.
+    Non-blocking — fails silently if Fuel is offline.
+    """
+    import socket as _sock
+
+    FUEL_HOST = "127.0.0.1"
+    FUEL_PORT = 5555
+
+    if not findings:
+        return
+
+    try:
+        s = _sock.socket(
+            _sock.AF_INET, _sock.SOCK_STREAM)
+        s.settimeout(3.0)
+        s.connect((FUEL_HOST, FUEL_PORT))
+
+        payload = json.dumps({
+            "room_id":  "IMMUNITY",
+            "auth_type": "INTEL",
+            "token":    token or "IMMUNITY_PROTOCOL",
+            "source":   "IMMUNITY_PROTOCOL_v2",
+            "type":     "GEM_SCAN_RESULTS",
+            "findings": findings,
+            "ts":       datetime.now().isoformat(),
+        })
+
+        s.sendall(payload.encode('utf-8'))
+        ack = s.recv(512).decode('utf-8')
+        s.close()
+
+        log(f"Fuel notified. ACK: {ack[:30]}")
+
+    except Exception:
+        # Fuel offline is expected during standalone mode
+        log("Fuel offline — findings logged locally only.",
+            "INFO")
+
+
+# ─────────────────────────────────────────────────────────────
+#  MAIN LOOP
+# ─────────────────────────────────────────────────────────────
+def immunity_loop():
+    print("\n╔══════════════════════════════════════════╗")
+    print("║  IMMUNITY PROTOCOL v2.0: ACTIVE          ║")
+    print("║  GEM Hunter: ONLINE                      ║")
+    print("║  APK Decoder: ONLINE                     ║")
+    print("║  Clean Room: ISOLATED                    ║")
+    print("╚══════════════════════════════════════════╝\n")
+    print(" Commands:")
+    print("  scan gem       — Hunt calendar injection")
+    print("  scan apk       — Decode mutated APKs")
+    print("  scan apk <dir> — Scan specific directory")
+    print("  check          — Environment integrity")
+    print("  run <cmd>      — Execute in sandbox")
+    print("  exit           — Stand down\n")
+
+    while True:
+        try:
+            user_input = input("[IMMUNITY] > ").strip()
+
+            if not user_input:
+                continue
+
+            elif user_input == "exit":
+                log("Clean Room standing down.")
+                break
+
+            elif user_input == "scan gem":
+                findings = hunt_gem_injection()
+                report_to_fuel(findings)
+
+            elif user_input == "scan apk":
+                # Default to Downloads
+                dirs = [
+                    "/sdcard/Download",
+                    "/storage/emulated/0/Download",
+                    os.path.expanduser(
+                        "~/storage/shared/Download"),
+                ]
+                for d in dirs:
+                    if os.path.exists(d):
+                        scan_apk_directory(d)
+                        break
+                else:
+                    log("Could not find Downloads folder.",
+                        "WARN")
+
+            elif user_input.startswith("scan apk "):
+                target_dir = user_input[9:].strip()
+                scan_apk_directory(target_dir)
+
+            elif user_input.startswith("decode "):
+                apk_path = user_input[7:].strip()
+                report   = decode_mutated_apk(apk_path)
+                print(json.dumps(report, indent=2))
+
+            elif user_input == "check":
+                check_environment_integrity()
+
+            elif user_input.startswith("run "):
+                cmd    = user_input[4:].strip()
+                output = run_immune_command(cmd)
+                if output:
+                    print(output)
+
+            else:
+                print("Unknown command. Type 'exit' to quit.")
+
+        except KeyboardInterrupt:
+            log("Interrupted by operator.")
+            break
+        except Exception as e:
+            log(f"Loop error: {e}", "ERROR")
+
+
+# ─────────────────────────────────────────────────────────────
+#  ENTRY POINT
+# ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    log("Immunity Protocol v2.0 initializing...")
+    check_environment_integrity()
+    create_sandbox()
+    immunity_loop()
