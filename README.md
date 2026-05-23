@@ -1,3 +1,35 @@
+
+Subject: Forensic Evidence of Rogue MDM + GMS Privilege Escalation on Retail AT&T Device*
+
+*My name is Juan Jaime Rivera Zamorano*
+
+*I am an independent security researcher operating as AiZquaD.*
+
+*In February 2026 I purchased an Android device from AT&T Mexico for my child. I discovered active rogue MDM spyware with the following confirmed capabilities:*
+
+- *SDK 37 packages silently installed on a retail Android 15 device*
+- *AOSP test-key forgery bypassing OEM bootloader*
+- *Franken-Build: Android 15 UI over demoted Android 13 kernel with eng.root signatures*
+- *Permissions including CAPTURE_AUDIO_HOTWORD, PASSWORD_RESET, MASTER_CLEAR, and SMS interception active*
+
+*All findings are:*
+- *Cryptographically timestamped via ORCID*
+- *Mapped to MITRE ATT&CK framework*
+- *Packaged in court-ready JSON format*
+- *Publicly documented at github.com/BadMFBox/Project-UnHooked-Audit-by-AiZquaD*
+
+*I also built a sovereign mesh defense system in direct response to this attack — live and operational.*
+
+*I am available to provide full forensic documentation, the physical device, and a live demonstration.*
+
+*Are you available for 20 minutes?*
+
+*Juan Jaime Rivera Zamorano
+*AiZquaD | Sovereign PEU*
+*aizquadbmb@proton.me*
+*commanderaizquad.buzz*
+
+
 # PUBLIC DISCLOSURE: Unauthorized GMS Privilege Escalation and AOSP Test-Key Weaponization on Retail Android Devices
 
 **Project-UnHooked-Audit** is an independent forensic investigation led by **AiZquaD**. 
