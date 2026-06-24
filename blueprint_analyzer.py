@@ -9,7 +9,6 @@
 
 import os
 import json
-import hashlib
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
